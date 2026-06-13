@@ -1,0 +1,35 @@
+[project]
+name = "rsi-search-pro-mcp"
+version = "0.1.0"
+description = "RSI Search Pro — a meta-MCP that transparently proxies the authority-web-search-mcp and browser-research-mcp Cloud Run services behind a single tool catalog. Upstream behaviour changes propagate instantly; this server only re-deploys when the routing/aggregation logic itself changes."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "RSI AI Platform" }]
+license = { text = "Apache-2.0" }
+keywords = ["mcp", "modelcontextprotocol", "proxy", "aggregator", "web-research"]
+
+dependencies = [
+    "mcp>=1.2",
+    "httpx>=0.27",
+    "pydantic>=2.9",
+    # In-process TTL cache for the upstream tools/list catalog so we don't
+    # re-discover on every list_tools request.
+    "cachetools>=5.3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "ruff>=0.7"]
+
+[project.scripts]
+rsi-search-pro = "rsi_search_pro.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rsi_search_pro"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

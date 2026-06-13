@@ -1,0 +1,99 @@
+# Continuous deployment to Cloud Run.
+#
+# Same WIF provider that the other MCPs (rbi-dbie-mcp,
+# browser-research-mcp) use — the pool's attribute_condition was widened
+# to allow any `rsi-ai-platform/*` repo to assume the deployer SA.
+
+name: Deploy to Cloud Run
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.github/CLOUD_RUN_CD.md'
+  workflow_dispatch:
+
+concurrency:
+  group: cloud-run-deploy
+  cancel-in-progress: true
+
+env:
+  PROJECT_ID: silverfox-454313
+  REGION: asia-south1
+  AR_REPO: agentic-rag
+  SERVICE: rsi-search-pro-mcp
+  IMAGE_BASE: asia-south1-docker.pkg.dev/silverfox-454313/agentic-rag/rsi-search-pro-mcp
+
+jobs:
+  deploy:
+    name: Build, push, deploy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # required for Workload Identity Federation
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SA }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker $REGION-docker.pkg.dev --quiet
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE_BASE }}:${{ github.sha }}
+            ${{ env.IMAGE_BASE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy $SERVICE \
+            --image=$IMAGE_BASE:${{ github.sha }} \
+            --region=$REGION \
+            --project=$PROJECT_ID \
+            --quiet
+
+      - name: Smoke-test the deployed MCP
+        run: |
+          URL=$(gcloud run services describe $SERVICE \
+            --region=$REGION --project=$PROJECT_ID \
+            --format='value(status.url)')
+          echo "Service URL: $URL"
+          # Stateless HTTP: no Mcp-Session-Id round-trip. Hit tools/list
+          # directly and confirm it merges 12 + 3 = 15 tools from upstreams.
+          RESP=$(curl -fsS -X POST "$URL/mcp" \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -d '{"jsonrpc":"2.0","id":"2","method":"tools/list","params":{}}')
+          echo "$RESP" | head -c 400
+          # Authority Web Search must contribute at least these names:
+          for T in pick_authority_domains web_search_authoritative pdf_fetch http_post_form; do
+            echo "$RESP" | grep -q "\"name\":\"$T\"" \
+              || { echo "::error::authority tool '$T' missing from proxy catalog"; exit 1; }
+          done
+          # Browser Research must contribute these:
+          for T in visit extract act; do
+            echo "$RESP" | grep -q "\"name\":\"$T\"" \
+              || { echo "::error::browser-research tool '$T' missing from proxy catalog"; exit 1; }
+          done
+          echo "✓ proxy aggregating both upstreams"
