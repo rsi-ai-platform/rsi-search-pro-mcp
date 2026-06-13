@@ -67,10 +67,15 @@ jobs:
 
       - name: Deploy to Cloud Run
         run: |
+          # --allow-unauthenticated is required for first deploys; Cloud Run
+          # defaults services to authenticated and the smoke test that follows
+          # would get a 403. Pure-aggregator endpoint with no secrets, so
+          # public ingress is fine — upstream MCPs enforce their own auth.
           gcloud run deploy $SERVICE \
             --image=$IMAGE_BASE:${{ github.sha }} \
             --region=$REGION \
             --project=$PROJECT_ID \
+            --allow-unauthenticated \
             --quiet
 
       - name: Smoke-test the deployed MCP
