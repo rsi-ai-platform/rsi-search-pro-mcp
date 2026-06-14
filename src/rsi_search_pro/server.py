@@ -160,8 +160,10 @@ def _build_progress_emitter():
     if rc is None:
         return None
 
-    # Pull the progressToken from the inbound tools/call params._meta.
-    meta = getattr(rc.request.params, "meta", None) if rc.request and rc.request.params else None
+    # The lowlevel MCP SDK parks the request metadata directly on
+    # RequestContext.meta (NOT inside rc.request.params). Field shape:
+    # mcp.types.RequestParams.Meta with .progressToken.
+    meta = getattr(rc, "meta", None)
     token = getattr(meta, "progressToken", None) if meta is not None else None
     if token is None:
         # Client didn't ask for progress — short-circuit to avoid pointless
