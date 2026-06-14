@@ -134,19 +134,84 @@ async def _list_tools() -> list[Tool]:
     return [_RESEARCH_TOOL, *proxied]
 
 
+def _build_progress_emitter():
+    """Return an async `emit(kind, data)` that pushes MCP progress
+    notifications to the calling client, or None when the client didn't
+    supply a progressToken.
+
+    Per MCP spec, the client opts in by attaching `_meta.progressToken`
+    to its tools/call params. The server then sends one or more
+    `notifications/progress` events tagged with that token until the
+    tool returns its final result. The high-level FastMCP Context class
+    wraps this; we replicate the wiring here because our `research`
+    tool is registered through the low-level call_tool handler (which
+    doesn't auto-inject Context).
+    """
+    try:
+        from mcp.server.lowlevel.server import request_ctx  # type: ignore
+        from mcp import types  # type: ignore
+    except Exception as e:  # noqa: BLE001
+        log.debug("progress notifications unavailable: %s", e)
+        return None
+    try:
+        rc = request_ctx.get()
+    except LookupError:
+        return None
+    if rc is None:
+        return None
+
+    # Pull the progressToken from the inbound tools/call params._meta.
+    meta = getattr(rc.request.params, "meta", None) if rc.request and rc.request.params else None
+    token = getattr(meta, "progressToken", None) if meta is not None else None
+    if token is None:
+        # Client didn't ask for progress — short-circuit to avoid pointless
+        # JSON serialisation on the hot path inside research().
+        return None
+    session = rc.session
+    counter = {"n": 0}
+
+    async def emit(kind: str, data: dict[str, Any]) -> None:
+        counter["n"] += 1
+        try:
+            payload = json.dumps({"kind": kind, "data": data}, default=str)
+        except Exception:  # noqa: BLE001
+            payload = json.dumps({"kind": kind, "data": {"error": "unserializable"}})
+        try:
+            await session.send_notification(
+                types.ServerNotification(
+                    types.ProgressNotification(
+                        method="notifications/progress",
+                        params=types.ProgressNotificationParams(
+                            progressToken=token,
+                            progress=float(counter["n"]),
+                            total=None,
+                            message=payload,
+                        ),
+                    )
+                )
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("send_notification failed: %s", e)
+
+    return emit
+
+
 @mcp._mcp_server.call_tool()  # type: ignore[misc]
 async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextContent]:
     """Route a tool call. Two paths:
       - `research` → run the in-house agentic loop (planner + executor +
-        observer + synthesizer).
+        observer + synthesizer). Streams progress to the calling client
+        when it included `_meta.progressToken` on the request.
       - any other name → transparent proxy to the upstream that owns it."""
     args = arguments or {}
     if name == "research":
+        emit = _build_progress_emitter()
         result = await proxy.research(
             args.get("query") or "",
             max_steps=int(args.get("max_steps", 12) or 12),
             max_seconds=float(args.get("max_seconds", 90) or 90),
             answer_style=str(args.get("answer_style", "concise") or "concise"),
+            emit=emit,
         )
     else:
         result = await proxy.call_upstream(name, args)

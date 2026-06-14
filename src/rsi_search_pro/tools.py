@@ -16,6 +16,7 @@ import os
 import re
 import time
 from datetime import datetime, timezone
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
@@ -768,14 +769,19 @@ async def research(
     max_seconds: float = 90.0,
     max_input_tokens: int = 25_000,
     answer_style: str = "concise",
+    emit: "Callable[[str, dict[str, Any]], Awaitable[None]] | None" = None,
 ) -> dict[str, Any]:
     """Agentic research loop. Planner → Executor → Observer → Synthesizer.
 
     Returns: {query, answer, confidence, citations, findings_count, trace,
               data_gap (if no answer), stats}.
 
-    The trace is rich and timestamped so a UI can render a live-feeling
-    timeline after the call returns.
+    If `emit` is provided, every trace event is also sent through it as
+    `await emit(kind, data)` while the loop runs — that's how the MCP
+    server's progress-notification path streams the loop live to the
+    calling client. `emit` is fire-and-forget; failures don't abort the
+    loop (we log and continue). The full trace is still returned at the
+    end for clients that don't subscribe.
     """
     t_overall = time.perf_counter()
     trace: list[dict[str, Any]] = []
@@ -786,6 +792,17 @@ async def research(
 
     def _now_ms() -> int:
         return round((time.perf_counter() - t_overall) * 1000)
+
+    async def _record(ev: dict[str, Any]) -> None:
+        """Append the event to the in-memory trace AND emit it live if a
+        sink is attached. Centralised so we can't accidentally emit
+        without recording, or vice versa."""
+        trace.append(ev)
+        if emit is not None:
+            try:
+                await emit(ev["kind"], ev)
+            except Exception as e:  # noqa: BLE001
+                log.warning("progress emit failed: %s", e)
 
     catalog, routing = await discover_tools()
     catalog_brief = _build_catalog_brief(catalog, routing)
@@ -802,7 +819,7 @@ async def research(
     plan = _parse_relaxed_json(plan_resp.get("text", ""))
     tokens_in_used += plan_resp.get("usage", {}).get("input_tokens", 0)
     tokens_out_used += plan_resp.get("usage", {}).get("output_tokens", 0)
-    trace.append({
+    await _record({
         "kind": "plan", "t_ms": _now_ms(),
         "duration_ms": round((time.perf_counter() - plan_t0) * 1000),
         "objective": plan.get("objective", "(planner returned no objective)"),
@@ -812,7 +829,7 @@ async def research(
         "usage": plan_resp.get("usage", {}),
     })
     if "error" in plan_resp:
-        trace.append({"kind": "planner_failed", "t_ms": _now_ms(),
+        await _record({"kind": "planner_failed", "t_ms": _now_ms(),
                        "error": plan_resp["error"]})
 
     objective = plan.get("objective") or query
@@ -825,13 +842,13 @@ async def research(
         # Budget gates
         if (time.perf_counter() - t_overall) > max_seconds:
             stopped_reason = "time_cap"
-            trace.append({"kind": "budget", "t_ms": _now_ms(),
+            await _record({"kind": "budget", "t_ms": _now_ms(),
                            "reason": "time_cap_hit",
                            "elapsed_s": round(time.perf_counter() - t_overall, 1)})
             break
         if tokens_in_used > max_input_tokens:
             stopped_reason = "token_cap"
-            trace.append({"kind": "budget", "t_ms": _now_ms(),
+            await _record({"kind": "budget", "t_ms": _now_ms(),
                            "reason": "token_cap_hit",
                            "tokens_in_used": tokens_in_used})
             break
@@ -855,7 +872,7 @@ async def research(
         steps_executed += 1
 
         err = _extract_error(result)
-        trace.append({
+        await _record({
             "kind": "step", "n": step_idx, "t_ms": _now_ms(),
             "duration_ms": step_dt,
             "tool": tool_name, "args": args, "rationale": rationale,
@@ -890,7 +907,7 @@ async def research(
         judgement = (obs.get("judgement") or "good").lower()
         observations.append({"n": step_idx, "judgement": judgement,
                               "notes": obs.get("notes", "")})
-        trace.append({
+        await _record({
             "kind": "observe", "n": step_idx, "t_ms": _now_ms(),
             "duration_ms": obs_dt,
             "judgement": judgement,
@@ -937,7 +954,7 @@ async def research(
     synth_dt = round((time.perf_counter() - synth_t0) * 1000)
     tokens_in_used += synth_resp.get("usage", {}).get("input_tokens", 0)
     tokens_out_used += synth_resp.get("usage", {}).get("output_tokens", 0)
-    trace.append({
+    await _record({
         "kind": "synth", "t_ms": _now_ms(),
         "duration_ms": synth_dt,
         "confidence": synth.get("confidence", "low"),
@@ -977,10 +994,21 @@ async def research(
             "priority": "normal",
             "requested_by": "rsi-search-pro.research",
         }
-        trace.append({"kind": "data_gap", "t_ms": _now_ms(),
+        await _record({"kind": "data_gap", "t_ms": _now_ms(),
                        "data_gap": data_gap})
 
     total_dt = round((time.perf_counter() - t_overall) * 1000)
+
+    # Terminal heartbeat — tells the client the stream is done before the
+    # JSON-RPC response lands. The frontend uses this to stop spinners
+    # without waiting for the full result body.
+    await _record({
+        "kind": "complete", "t_ms": _now_ms(),
+        "confidence": confidence,
+        "answer_preview": answer[:300],
+        "stopped_reason": stopped_reason,
+    })
+
     return {
         "query": query,
         "answer": answer,
