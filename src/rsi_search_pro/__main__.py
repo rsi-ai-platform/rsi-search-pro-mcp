@@ -55,8 +55,16 @@ def main() -> None:
 
         mcp.settings.host = args.host
         mcp.settings.port = args.port
+        # Stateless sessions stay on (each request creates its own MCP
+        # session — no server-side state across requests). But
+        # json_response is now OFF so we ship the response as SSE rather
+        # than a single JSON body. SSE is what allows `research` to emit
+        # notifications/progress events live to subscribed clients
+        # (Layer 1 of the streaming work). Non-streaming callers parse
+        # the single `data:` event identically to a plain JSON body —
+        # backend MCPClient's _parse_sse_single handles both.
         mcp.settings.stateless_http = True
-        mcp.settings.json_response = True
+        mcp.settings.json_response = False
         mcp.run("streamable-http")
     else:
         print(f"unknown transport: {args.transport}", file=sys.stderr)
