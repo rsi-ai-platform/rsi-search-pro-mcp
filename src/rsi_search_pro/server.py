@@ -149,7 +149,6 @@ def _build_progress_emitter():
     """
     try:
         from mcp.server.lowlevel.server import request_ctx  # type: ignore
-        from mcp import types  # type: ignore
     except Exception as e:  # noqa: BLE001
         log.debug("progress notifications unavailable: %s", e)
         return None
@@ -165,21 +164,18 @@ def _build_progress_emitter():
     # mcp.types.RequestParams.Meta with .progressToken.
     meta = getattr(rc, "meta", None)
     token = getattr(meta, "progressToken", None) if meta is not None else None
-    # Verbose one-time debug — what's actually in the context. Remove
-    # once the streaming path is stable.
-    try:
-        rc_keys = sorted(k for k in dir(rc) if not k.startswith("_"))[:12]
-        req_obj = getattr(rc, "request", None)
-        req_attrs = sorted(k for k in dir(req_obj) if not k.startswith("_"))[:12] if req_obj else None
-        log.info("progress emitter probe: meta=%r token=%r rc_keys=%r req=%r req_attrs=%r",
-                  meta, token, rc_keys, type(req_obj).__name__ if req_obj else None, req_attrs)
-    except Exception as e:  # noqa: BLE001
-        log.warning("probe failed: %s", e)
     if token is None:
         # Client didn't ask for progress — short-circuit to avoid pointless
         # JSON serialisation on the hot path inside research().
         return None
     session = rc.session
+    # CRITICAL: streamable-HTTP's message router needs `related_request_id`
+    # on every server-initiated message, otherwise it routes the notification
+    # to the standalone SSE stream (GET_STREAM_KEY) — which doesn't exist
+    # for a plain POST request, so the event is silently dropped. By passing
+    # rc.request_id, the router delivers each progress event onto the same
+    # per-request SSE stream the client is reading the tool response from.
+    related_id = getattr(rc, "request_id", None)
     counter = {"n": 0}
 
     async def emit(kind: str, data: dict[str, Any]) -> None:
@@ -189,21 +185,15 @@ def _build_progress_emitter():
         except Exception:  # noqa: BLE001
             payload = json.dumps({"kind": kind, "data": {"error": "unserializable"}})
         try:
-            await session.send_notification(
-                types.ServerNotification(
-                    types.ProgressNotification(
-                        method="notifications/progress",
-                        params=types.ProgressNotificationParams(
-                            progressToken=token,
-                            progress=float(counter["n"]),
-                            total=None,
-                            message=payload,
-                        ),
-                    )
-                )
+            await session.send_progress_notification(
+                progress_token=token,
+                progress=float(counter["n"]),
+                total=None,
+                message=payload,
+                related_request_id=str(related_id) if related_id is not None else None,
             )
         except Exception as e:  # noqa: BLE001
-            log.warning("send_notification failed: %s", e)
+            log.warning("send_progress_notification failed: %s", e)
 
     return emit
 
