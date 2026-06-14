@@ -22,34 +22,54 @@ log = logging.getLogger("rsi_search_pro.server")
 
 _INSTRUCTIONS = (
     "RSI Search Pro — one MCP, all the web-research firepower. This server "
-    "transparently aggregates the tool catalogs of two upstream services:\n"
+    "aggregates the tool catalogs of SIX upstream MCPs into one place and "
+    "exposes a high-level agentic tool that orchestrates them for you:\n"
     "\n"
-    "  • authority-web-search-mcp — Tavily-backed authoritative web search, "
-    "    PDF fetch+structured extraction, AJAX-form POST, sitemap walk, "
-    "    Indian-context default routing, query playbook hints.\n"
-    "  • browser-research-mcp — real Chromium (patched Playwright) with "
-    "    Sonnet vision. Use ONLY when the cheap rungs fail.\n"
+    "  • authority-web-search-mcp — Tavily authoritative search, PDF / "
+    "    Excel / CSV fetch + structured extraction, AJAX-form POST, sitemap.\n"
+    "  • browser-research-mcp — real Chromium (patched Playwright) +\n"
+    "    Sonnet vision. Last-resort for JS-rendered pages.\n"
+    "  • rbi-dbie — Reserve Bank of India Database on Indian Economy.\n"
+    "  • mospi-esankhyiki — MoSPI macro (CPI/IIP/GDP/ASI).\n"
+    "  • data-gov-in — 100k+ Indian govt open datasets.\n"
+    "  • cga — Controller General of Accounts (union/state public finance).\n"
     "\n"
-    "FETCH LADDER — follow it strictly:\n"
-    "  1. web_search_authoritative / pick_authority_domains  → discover sources\n"
-    "  2. web_fetch_structured                              → simple HTML pages\n"
-    "  3. pdf_discover → pdf_fetch / pdf_fetch_structured   → text PDFs (incl. octet-stream)\n"
-    "  4. http_post_form                                     → AJAX dropdowns (PPAC-style)\n"
-    "  5. visit / extract / act (browser-research)          → last resort: JS-rendered\n"
-    "       SPAs, login walls, chart-only values drawn via canvas/SVG, dynamic\n"
-    "       dropdowns whose data isn't in the HTML. Slower (5-15× the PDF rung)\n"
-    "       but universal.\n"
+    "TWO WAYS TO USE THIS MCP:\n"
     "\n"
-    "Use `act(url, steps, focus)` for browser flows that need interaction — "
-    "selecting a Year/Month dropdown, clicking a tab, scrolling. Use "
-    "`extract(url, focus)` when the data is already on the rendered page. Use "
-    "`visit(url)` for a cheap snapshot when you just want to see the page.\n"
+    "  1. HIGH-LEVEL  →  `research(query)`  ← RECOMMENDED for most queries.\n"
+    "     Runs its own planner → executor → observer → synthesizer loop\n"
+    "     inside RSI Search Pro using Sonnet + Haiku, calling the right\n"
+    "     low-level tools on the right upstreams, observing each result,\n"
+    "     re-routing on empty/wrong/error, synthesizing a cited final\n"
+    "     answer. Returns a rich trace so the caller can render the\n"
+    "     reasoning + tool timeline. Always keeps the user's objective\n"
+    "     in focus; never gives up silently — on failure it returns an\n"
+    "     honest 'I could not answer' plus a data_gap dict the platform\n"
+    "     can queue for follow-up ingest.\n"
+    "\n"
+    "  2. LOW-LEVEL   →  call any of the 50+ aggregated tools directly.\n"
+    "     The catalog is the union of every upstream's tools/list. Pick\n"
+    "     these when you already know exactly which tool you want and\n"
+    "     don't need the orchestrator's overhead (~$0.05 + ~30s).\n"
+    "\n"
+    "FETCH LADDER (the orchestrator follows this; you should too if going\n"
+    "low-level):\n"
+    "  1. pick_authority_domains            → routing via the query playbook\n"
+    "  2. web_fetch_structured              → simple HTML pages\n"
+    "  3. pdf_fetch_structured              → text PDFs\n"
+    "  4. excel_fetch_structured            → spreadsheets (GST, CGA, MoSPI)\n"
+    "  5. http_post_form                    → AJAX-dropdown gov dashboards\n"
+    "  6. Source-specific tools:\n"
+    "       RBI DBIE get_data               → repo rate, FX, money supply\n"
+    "       eSankhyiki get_data             → CPI, IIP, GDP\n"
+    "       data.gov.in search_datasets     → long-tail Indian datasets\n"
+    "       CGA get_monthly_account         → union accounts, NSDP\n"
+    "  7. browser-research visit/act/extract → last resort (5-45s, Chromium)\n"
     "\n"
     "INDIAN FISCAL YEAR: tables labelled '2025-2026' / 'FY26' span April 2025 "
-    "to March 2026 — the April…December columns are the FIRST year, January-"
-    "March the SECOND. Never read 'April' in an FY-labelled table as the "
-    "current calendar year by default. This rule is baked into the upstream "
-    "extraction prompts as well."
+    "to March 2026 — April…December are the FIRST year, Jan–March the SECOND. "
+    "Never read 'April' in an FY-labelled table as the current calendar year "
+    "by default."
 )
 
 
@@ -59,12 +79,51 @@ _INSTRUCTIONS = (
 mcp = FastMCP("rsi-search-pro", instructions=_INSTRUCTIONS)
 
 
+# Static descriptor for the agentic high-level tool — first entry in the
+# catalog so calling agents see it before the 50+ proxied tools.
+_RESEARCH_TOOL = Tool(
+    name="research",
+    description=(
+        "Agentic research over all 6 upstream MCPs. Give it a question; it "
+        "plans, executes, observes each result, re-routes on empty/wrong, "
+        "and returns a cited answer plus a step-by-step trace. Use this "
+        "when you want 'just answer the question'. For fine-grained tool "
+        "control, call the lower-level tools directly. Latency ~5-45s; "
+        "internal model spend ~$0.02-$0.15 per call."
+    ),
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": (
+                    "The user's question. Be specific. Examples: 'GST monthly "
+                    "collections for the last 4 months', 'India CPI YoY May "
+                    "2026', 'RBI repo rate as of today', 'Domestic LPG "
+                    "consumption FY2024-25 month by month'."
+                ),
+            },
+            "max_steps": {"type": "integer", "default": 12,
+                            "description": "Hard cap on tool calls (1-24)."},
+            "max_seconds": {"type": "number", "default": 90,
+                              "description": "Wall-time cap in seconds."},
+            "answer_style": {
+                "type": "string", "enum": ["concise", "detailed"],
+                "default": "concise",
+                "description": "How long the synthesised answer should be.",
+            },
+        },
+        "required": ["query"],
+    },
+)
+
+
 @mcp._mcp_server.list_tools()  # type: ignore[misc]
 async def _list_tools() -> list[Tool]:
-    """Return the merged catalog. Re-discovered after the 5-min TTL expires;
-    cache hits return in <1 ms."""
+    """Return `research` + the merged proxy catalog. Catalog hits the
+    in-process TTL cache after the first request."""
     catalog, _ = await proxy.discover_tools()
-    return [
+    proxied = [
         Tool(
             name=t["name"],
             description=t.get("description", ""),
@@ -72,16 +131,25 @@ async def _list_tools() -> list[Tool]:
         )
         for t in catalog
     ]
+    return [_RESEARCH_TOOL, *proxied]
 
 
 @mcp._mcp_server.call_tool()  # type: ignore[misc]
 async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextContent]:
-    """Route a tool call to whichever upstream owns the name. We unwrap the
-    upstream's response back to a typed JSON object, then re-wrap as a single
-    TextContent block so the calling agent sees the same shape it would from
-    calling the upstream directly."""
-    result = await proxy.call_upstream(name, arguments or {})
-    # Match upstream's serialisation: pretty JSON in a single text block.
+    """Route a tool call. Two paths:
+      - `research` → run the in-house agentic loop (planner + executor +
+        observer + synthesizer).
+      - any other name → transparent proxy to the upstream that owns it."""
+    args = arguments or {}
+    if name == "research":
+        result = await proxy.research(
+            args.get("query") or "",
+            max_steps=int(args.get("max_steps", 12) or 12),
+            max_seconds=float(args.get("max_seconds", 90) or 90),
+            answer_style=str(args.get("answer_style", "concise") or "concise"),
+        )
+    else:
+        result = await proxy.call_upstream(name, args)
     return [TextContent(type="text", text=json.dumps(result, default=str))]
 
 

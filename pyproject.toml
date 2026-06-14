@@ -15,6 +15,10 @@ dependencies = [
     # In-process TTL cache for the upstream tools/list catalog so we don't
     # re-discover on every list_tools request.
     "cachetools>=5.3",
+    # Used by the agentic `research()` tool for the planner / observer /
+    # synthesizer LLM calls. Optional at runtime — without ANTHROPIC_API_KEY
+    # the proxy-only surface still works.
+    "anthropic>=0.40",
 ]
 
 [project.optional-dependencies]
