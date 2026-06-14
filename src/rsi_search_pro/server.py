@@ -165,6 +165,16 @@ def _build_progress_emitter():
     # mcp.types.RequestParams.Meta with .progressToken.
     meta = getattr(rc, "meta", None)
     token = getattr(meta, "progressToken", None) if meta is not None else None
+    # Verbose one-time debug — what's actually in the context. Remove
+    # once the streaming path is stable.
+    try:
+        rc_keys = sorted(k for k in dir(rc) if not k.startswith("_"))[:12]
+        req_obj = getattr(rc, "request", None)
+        req_attrs = sorted(k for k in dir(req_obj) if not k.startswith("_"))[:12] if req_obj else None
+        log.info("progress emitter probe: meta=%r token=%r rc_keys=%r req=%r req_attrs=%r",
+                  meta, token, rc_keys, type(req_obj).__name__ if req_obj else None, req_attrs)
+    except Exception as e:  # noqa: BLE001
+        log.warning("probe failed: %s", e)
     if token is None:
         # Client didn't ask for progress — short-circuit to avoid pointless
         # JSON serialisation on the hot path inside research().
