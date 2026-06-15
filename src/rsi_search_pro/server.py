@@ -243,12 +243,36 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
       - any other name → transparent proxy to the upstream that owns it."""
     args = arguments or {}
     if name == "today":
-        # Native anchor — same shape as every Indian-data MCP's `today`.
+        # Native anchor — same shape as every Indian-data MCP's `today`,
+        # plus rich FY arithmetic so the agent doesn't off-by-one when
+        # interpreting 'last N years' on relative-time queries.
         from datetime import datetime as _dt, timedelta as _td, timezone as _tz
         ist = _tz(_td(hours=5, minutes=30))
         now = _dt.now(ist)
-        fy_start = now.year if now.month >= 4 else now.year - 1
-        fy_end = fy_start + 1
+        # Indian FY: April→March. FY{YY} = 1 Apr 20{YY-1} → 31 Mar 20{YY}.
+        # FY-Q1 = Apr-May-Jun, Q2 = Jul-Aug-Sep, Q3 = Oct-Nov-Dec, Q4 = Jan-Feb-Mar.
+        current_fy_start = now.year if now.month >= 4 else now.year - 1
+        current_fy_end = current_fy_start + 1
+        # Months elapsed inside the current FY (April = 1).
+        if now.month >= 4:
+            fy_months_elapsed = now.month - 3
+        else:
+            fy_months_elapsed = now.month + 9
+        fy_quarter_in = (fy_months_elapsed - 1) // 3 + 1
+        # The agent must NOT conflate "current FY" with "completed FY".
+        # last_completed_fy = the FY that ended March 31 immediately before today.
+        last_completed_fy_start = current_fy_start - 1
+        # last_3_completed_fys (oldest → newest).
+        def _fy_label(start: int) -> str:
+            return f"FY{str(start + 1)[-2:]}"  # FY{YY end-year}
+        last_3 = [_fy_label(last_completed_fy_start - 2),
+                   _fy_label(last_completed_fy_start - 1),
+                   _fy_label(last_completed_fy_start)]
+        last_3_ranges = [
+            f"{last_completed_fy_start - 2}-04-01 → {last_completed_fy_start - 1}-03-31",
+            f"{last_completed_fy_start - 1}-04-01 → {last_completed_fy_start}-03-31",
+            f"{last_completed_fy_start}-04-01 → {last_completed_fy_start + 1}-03-31",
+        ]
         result = {
             "iso_date": now.strftime("%Y-%m-%d"),
             "iso_datetime": now.isoformat(),
@@ -257,16 +281,27 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
             "month_num": now.month,
             "day": now.day,
             "weekday": now.strftime("%A"),
-            "quarter": f"Q{(now.month - 1) // 3 + 1}",
-            "financial_year_in": f"FY{str(fy_end)[-2:]}",
-            "fy_label": f"{fy_start}-{fy_end}",
+            "calendar_quarter": f"Q{(now.month - 1) // 3 + 1}",
             "timezone": "Asia/Kolkata (IST, UTC+05:30)",
+            # --- Indian fiscal-year math ---
+            "financial_year_in": _fy_label(current_fy_start),  # FY27 today
+            "fy_label": f"{current_fy_start}-{current_fy_end}",
+            "fy_quarter_in": f"Q{fy_quarter_in}",            # Q1 today (Apr-May-Jun)
+            "fy_month_in": fy_months_elapsed,                  # M3 today (June)
+            "fy_status": "in-progress",                        # always — today can't be in a completed FY
+            "last_completed_fy_in": _fy_label(last_completed_fy_start),
+            "last_3_completed_fys_in": last_3,
+            "last_3_completed_fy_ranges": last_3_ranges,
             "note": (
-                "FY in India is April→March. FY{YY} = 1 Apr 20{YY-1} → "
-                "31 Mar 20{YY}. Use iso_date as the anchor for relative "
-                "phrases ('latest', 'last 3 years', 'this quarter', "
-                "'YTD'). Pass concrete dates derived from this to the "
-                "downstream tools."
+                "Indian FY runs April→March. FY{YY} = 1 Apr 20{YY-1} → "
+                "31 Mar 20{YY}. CRITICAL FOR 'LAST N YEARS' QUERIES: "
+                "the current FY (financial_year_in above) is IN PROGRESS — "
+                "do NOT include it in 'last N completed years'. 'Last 3 "
+                "years' → last_3_completed_fys_in. To also fetch partial "
+                "data for the in-progress FY, use fy_quarter_in + "
+                "fy_month_in. Skipping this distinction leads to "
+                "off-by-one errors (querying FY{YY-3}..FY{YY-1} instead "
+                "of FY{YY-2}..FY{YY})."
             ),
         }
         return [TextContent(type="text", text=json.dumps(result, default=str))]
