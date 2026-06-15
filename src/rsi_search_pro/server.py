@@ -130,10 +130,31 @@ _RESEARCH_TOOL = Tool(
 )
 
 
+# Native `today` tool — every Indian-data MCP exposes one, but when we
+# merge upstream catalogs the per-upstream `today` tools collide and get
+# namespaced (aws__today, rbi__today). The agent then often skips the
+# anchor step because no bare `today` exists. Exposing it natively at
+# the top of the catalog forces the planner / model to see exactly the
+# same `today` name they see on every other Indian-data MCP.
+_TODAY_TOOL = Tool(
+    name="today",
+    description=(
+        "Return the SERVER'S CURRENT DATE (IST, Asia/Kolkata). Call this "
+        "FIRST whenever the user mentions a temporal phrase like \"latest\", "
+        "\"current\", \"today\", \"yesterday\", \"this quarter\", \"this "
+        "year\", \"last 3 years\" — your training-data cutoff is NOT a "
+        "reliable anchor for what 'today' actually is. Use the returned "
+        "`iso_date` and `financial_year_in` to construct concrete queries "
+        "you pass to the other tools."
+    ),
+    inputSchema={"type": "object", "properties": {}},
+)
+
+
 @mcp._mcp_server.list_tools()  # type: ignore[misc]
 async def _list_tools() -> list[Tool]:
-    """Return `research` + the merged proxy catalog. Catalog hits the
-    in-process TTL cache after the first request."""
+    """Return `today` + `research` + the merged proxy catalog. Catalog hits
+    the in-process TTL cache after the first request."""
     catalog, _ = await proxy.discover_tools()
     proxied = [
         Tool(
@@ -141,9 +162,12 @@ async def _list_tools() -> list[Tool]:
             description=t.get("description", ""),
             inputSchema=t.get("inputSchema") or {"type": "object", "properties": {}},
         )
+        # Drop namespaced today copies — we shadow them with our own bare
+        # `today` below so the planner sees ONE canonical anchor tool.
         for t in catalog
+        if not t["name"].endswith("__today")
     ]
-    return [_RESEARCH_TOOL, *proxied]
+    return [_TODAY_TOOL, _RESEARCH_TOOL, *proxied]
 
 
 def _build_progress_emitter():
@@ -218,6 +242,34 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
         when it included `_meta.progressToken` on the request.
       - any other name → transparent proxy to the upstream that owns it."""
     args = arguments or {}
+    if name == "today":
+        # Native anchor — same shape as every Indian-data MCP's `today`.
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        ist = _tz(_td(hours=5, minutes=30))
+        now = _dt.now(ist)
+        fy_start = now.year if now.month >= 4 else now.year - 1
+        fy_end = fy_start + 1
+        result = {
+            "iso_date": now.strftime("%Y-%m-%d"),
+            "iso_datetime": now.isoformat(),
+            "year": now.year,
+            "month": now.strftime("%B"),
+            "month_num": now.month,
+            "day": now.day,
+            "weekday": now.strftime("%A"),
+            "quarter": f"Q{(now.month - 1) // 3 + 1}",
+            "financial_year_in": f"FY{str(fy_end)[-2:]}",
+            "fy_label": f"{fy_start}-{fy_end}",
+            "timezone": "Asia/Kolkata (IST, UTC+05:30)",
+            "note": (
+                "FY in India is April→March. FY{YY} = 1 Apr 20{YY-1} → "
+                "31 Mar 20{YY}. Use iso_date as the anchor for relative "
+                "phrases ('latest', 'last 3 years', 'this quarter', "
+                "'YTD'). Pass concrete dates derived from this to the "
+                "downstream tools."
+            ),
+        }
+        return [TextContent(type="text", text=json.dumps(result, default=str))]
     if name == "research":
         emit = _build_progress_emitter()
         eu_raw = args.get("enabled_upstreams")
