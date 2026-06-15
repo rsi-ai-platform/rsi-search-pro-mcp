@@ -84,7 +84,14 @@ class HybridAuthMiddleware(BaseHTTPMiddleware):
         """Returns (ok, email_or_reason)."""
         try:
             if self._gauth is None:
-                from google.auth.transport import requests as grequests
+                # google.auth.transport.requests needs `requests` installed.
+                # We list it in every MCP's pyproject so this import
+                # succeeds; the fallback message helps surface a missing
+                # dep loudly instead of "id_token verify failed: …".
+                try:
+                    from google.auth.transport import requests as grequests
+                except ImportError as e:  # noqa: BLE001
+                    return False, f"id_token transport missing — add 'requests' to deps: {e}"
                 from google.oauth2 import id_token as gid_token
                 self._gauth = (gid_token, grequests.Request())
             gid_token, request = self._gauth
