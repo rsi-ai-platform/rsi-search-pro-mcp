@@ -415,15 +415,24 @@ async def discover_tools(
     return catalog, routing
 
 
-async def call_upstream(tool_name: str, arguments: dict[str, Any]) -> Any:
+async def call_upstream(
+    tool_name: str, arguments: dict[str, Any],
+    *, routing: dict[str, tuple[str, str]] | None = None,
+) -> Any:
     """Proxy a tools/call to whichever upstream owns `tool_name`.
+
+    `routing` lets the caller pass in a pre-filtered routing table — used by
+    research() when the user passed enabled_upstreams=[…] and the planner
+    saw a scoped catalog. Without it, the executor would re-discover with
+    the default pool and fail to route any opt-in upstream's tool.
 
     Returns the upstream's response unwrapped to its native shape (the tool's
     own returned dict — not the MCP `content` envelope). When the upstream's
     content is JSON-shaped (our case for all of authority-web-search and
     browser-research tools), we parse it; otherwise we wrap as `{text: …}`.
     """
-    _, routing = await discover_tools()
+    if routing is None:
+        _, routing = await discover_tools()
     entry = routing.get(tool_name)
     if entry is None:
         # Re-discover once — upstream may have just rolled a new tool.
@@ -890,7 +899,7 @@ async def research(
 
         step_t0 = time.perf_counter()
         try:
-            result = await call_upstream(tool_name, args)
+            result = await call_upstream(tool_name, args, routing=routing)
         except Exception as e:  # noqa: BLE001
             result = {"error": str(e), "exception": True}
         step_dt = round((time.perf_counter() - step_t0) * 1000)
