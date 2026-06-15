@@ -19,6 +19,13 @@ dependencies = [
     # synthesizer LLM calls. Optional at runtime — without ANTHROPIC_API_KEY
     # the proxy-only surface still works.
     "anthropic>=0.40",
+    # Hybrid auth middleware needs uvicorn (manual ASGI run so we can add
+    # middleware) + google-auth for Google id-token verification. starlette
+    # ships transitively with mcp; we depend on it explicitly so the
+    # middleware imports don't break if mcp changes its stack.
+    "uvicorn>=0.30",
+    "starlette>=0.40",
+    "google-auth>=2.30",
 ]
 
 [project.optional-dependencies]

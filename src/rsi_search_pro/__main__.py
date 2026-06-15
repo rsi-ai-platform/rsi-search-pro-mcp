@@ -65,7 +65,20 @@ def main() -> None:
         # backend MCPClient's _parse_sse_single handles both.
         mcp.settings.stateless_http = True
         mcp.settings.json_response = False
-        mcp.run("streamable-http")
+        # Replace the convenience `mcp.run("streamable-http")` with manual
+        # uvicorn so we can attach the hybrid auth middleware. SERVICE_URL
+        # MUST be the public URL the MCP is reachable at — Google id-tokens
+        # are minted with this as the `aud` claim, and verification will
+        # reject any token addressed to a different audience. Falls back
+        # to "<unset>" in local-dev where neither client uses id-tokens.
+        import uvicorn  # local import keeps stdio mode dep-free
+        from ._auth import install_auth_middleware
+        app = mcp.streamable_http_app()
+        install_auth_middleware(
+            app,
+            service_url=os.environ.get("SERVICE_URL", "<unset>"),
+        )
+        uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     else:
         print(f"unknown transport: {args.transport}", file=sys.stderr)
         sys.exit(2)
