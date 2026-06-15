@@ -93,7 +93,49 @@ UPSTREAMS: dict[str, dict[str, Any]] = {
             "for Indian macro indicators."
         ),
     },
+    # OPT-IN upstreams below — not in DEFAULT_ENABLED_UPSTREAMS. They
+    # appear in the merged catalog only when the caller explicitly opts
+    # into them via research(enabled_upstreams=[...]). Keeps the default
+    # surface lean for cost + reliability while letting the playground
+    # surface them as toggles.
+    "cga": {
+        "url": os.environ.get(
+            "CGA_URL",
+            "https://cga-mcp-pef65a33ta-uc.a.run.app/mcp",
+        ),
+        "stateful": True,
+        "token": os.environ.get("CGA_AUTH_TOKEN"),
+        "capability": (
+            "Controller General of Accounts (Ministry of Finance). "
+            "Monthly union government accounts, NSDP (state-level fiscal "
+            "indicators), finance accounts, circulars, dashboard data."
+        ),
+    },
+    "data-gov": {
+        "url": os.environ.get(
+            "DATA_GOV_URL",
+            "https://data-gov-mcp-pef65a33ta-el.a.run.app/mcp",
+        ),
+        "stateful": False,
+        "token": None,
+        "capability": (
+            "India's open-data portal — 100k+ government datasets across "
+            "every ministry and state. Long-tail discovery for queries the "
+            "core upstreams can't satisfy."
+        ),
+    },
 }
+
+
+# Upstreams included when the caller does not pass enabled_upstreams on
+# the research() call. The opt-in ones (cga, data-gov) sit in UPSTREAMS so
+# they can be turned on per call from the playground UI without a redeploy.
+DEFAULT_ENABLED_UPSTREAMS: frozenset[str] = frozenset({
+    "authority-web-search",
+    "browser-research",
+    "rbi-dbie",
+    "mospi-esankhyiki",
+})
 
 
 # ============================================================================
@@ -138,7 +180,6 @@ async def _http() -> httpx.AsyncClient:
 # ============================================================================
 
 _catalog_cache: TTLCache = TTLCache(maxsize=1, ttl=300)
-_routing_cache: TTLCache = TTLCache(maxsize=1, ttl=300)
 _discover_lock = asyncio.Lock()
 
 
@@ -151,6 +192,8 @@ _UPSTREAM_SHORT_ID: dict[str, str] = {
     "browser-research": "br",
     "rbi-dbie": "rbi",
     "mospi-esankhyiki": "mospi",
+    "cga": "cga",
+    "data-gov": "dgov",
 }
 
 
@@ -290,85 +333,86 @@ async def _rpc(url: str, method: str, params: dict[str, Any] | None = None,
                            req_id=req_id, timeout=timeout)
 
 
-async def discover_tools(*, force: bool = False) -> tuple[list[dict[str, Any]], dict[str, str]]:
-    """Query both upstreams' tools/list, merge into a flat catalog, build a
-    routing table mapping each tool name back to its upstream.
+async def discover_tools(
+    *, force: bool = False,
+    enabled: frozenset[str] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, tuple[str, str]]]:
+    """Query upstreams' tools/list, merge into a flat catalog, build a routing
+    table mapping exposed name → (upstream, original_name).
 
-    Cached for 5 min. On cache miss (or `force=True`), the discovery runs
-    against both upstreams in parallel. Failures on one upstream don't fail
-    the whole call — the live one's tools are still surfaced.
+    `enabled` restricts the merged catalog to a subset of UPSTREAMS. When
+    None, falls back to DEFAULT_ENABLED_UPSTREAMS. The raw per-upstream
+    tools_list discovery is cached for 5 min (force=True to bust); only the
+    filter pass runs on every call, so different `enabled` sets share the
+    same network discovery.
     """
-    if not force:
-        cached = _catalog_cache.get("c")
-        cached_r = _routing_cache.get("r")
-        if cached is not None and cached_r is not None:
-            return cached, cached_r
+    enabled_set = (
+        enabled if enabled is not None else DEFAULT_ENABLED_UPSTREAMS
+    ) & set(UPSTREAMS.keys())
 
-    async with _discover_lock:
-        # Re-check under the lock — somebody else might have populated.
-        if not force:
-            cached = _catalog_cache.get("c")
-            cached_r = _routing_cache.get("r")
-            if cached is not None and cached_r is not None:
-                return cached, cached_r
+    raw = None if force else _catalog_cache.get("raw")
+    if raw is None:
+        async with _discover_lock:
+            if not force:
+                raw = _catalog_cache.get("raw")
+            if raw is None:
+                async def _one(name: str) -> tuple[str, list[dict[str, Any]]]:
+                    try:
+                        resp = await _rpc_to(name, "tools/list",
+                                               req_id=f"list-{name}", timeout=20.0)
+                        if "error" in resp:
+                            log.warning("upstream %s tools/list error: %s",
+                                         name, resp["error"])
+                            return name, []
+                        return name, list(resp.get("result", {}).get("tools") or [])
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("upstream %s unreachable: %s", name, e)
+                        return name, []
 
-        async def _one(name: str) -> tuple[str, list[dict[str, Any]]]:
-            try:
-                resp = await _rpc_to(name, "tools/list",
-                                       req_id=f"list-{name}", timeout=20.0)
-                if "error" in resp:
-                    log.warning("upstream %s tools/list error: %s",
-                                 name, resp["error"])
-                    return name, []
-                return name, list(resp.get("result", {}).get("tools") or [])
-            except Exception as e:  # noqa: BLE001
-                log.warning("upstream %s unreachable: %s", name, e)
-                return name, []
+                results = await asyncio.gather(
+                    *(_one(name) for name in UPSTREAMS)
+                )
+                raw = dict(results)
+                _catalog_cache["raw"] = raw
 
-        results = await asyncio.gather(
-            *(_one(name) for name in UPSTREAMS)
-        )
+    # Filter to the enabled subset, then merge with collision-namespacing.
+    from collections import Counter
+    filtered = {n: tools for n, tools in raw.items() if n in enabled_set}
+    name_counts: Counter = Counter()
+    for tools_list in filtered.values():
+        for t in tools_list:
+            if t.get("name"):
+                name_counts[t["name"]] += 1
 
-        # First pass: count how many upstreams export each tool name.
-        from collections import Counter
-        name_counts: Counter = Counter()
-        for upstream_name, tools_list in results:
-            for t in tools_list:
-                if t.get("name"):
-                    name_counts[t["name"]] += 1
+    catalog: list[dict[str, Any]] = []
+    routing: dict[str, tuple[str, str]] = {}
+    for upstream_name, tools_list in filtered.items():
+        short = _UPSTREAM_SHORT_ID.get(upstream_name, upstream_name)
+        for t in tools_list:
+            original = t.get("name")
+            if not original:
+                continue
+            if name_counts[original] > 1:
+                exposed = f"{short}__{original}"
+                desc = f"[{upstream_name}] " + (t.get("description") or "")
+            else:
+                exposed = original
+                desc = t.get("description") or ""
+            routing[exposed] = (upstream_name, original)
+            catalog.append({
+                "name": exposed,
+                "description": desc,
+                "inputSchema": t.get("inputSchema"),
+            })
 
-        # Second pass: emit catalog with namespacing on collisions.
-        # routing[name] = (upstream, original_name) so call_upstream can
-        # un-prefix before dispatching to the upstream.
-        catalog: list[dict[str, Any]] = []
-        routing: dict[str, tuple[str, str]] = {}
-        for upstream_name, tools_list in results:
-            short = _UPSTREAM_SHORT_ID.get(upstream_name, upstream_name)
-            for t in tools_list:
-                original = t.get("name")
-                if not original:
-                    continue
-                if name_counts[original] > 1:
-                    # Collision: prefix EVERY copy so no caller silently
-                    # gets the wrong upstream's tool.
-                    exposed = f"{short}__{original}"
-                    desc = f"[{upstream_name}] " + (t.get("description") or "")
-                else:
-                    exposed = original
-                    desc = t.get("description") or ""
-                routing[exposed] = (upstream_name, original)
-                catalog.append({
-                    "name": exposed,
-                    "description": desc,
-                    "inputSchema": t.get("inputSchema"),
-                })
-
-        _catalog_cache["c"] = catalog
-        _routing_cache["r"] = routing
-        log.info("catalog refreshed: %d tools across %d upstreams "
-                  "(collisions: %d)", len(catalog), len(UPSTREAMS),
-                  sum(1 for n, c in name_counts.items() if c > 1))
-        return catalog, routing
+    log.info(
+        "catalog built: %d tools across %d enabled upstreams "
+        "(collisions: %d, enabled: %s)",
+        len(catalog), len(filtered),
+        sum(1 for n, c in name_counts.items() if c > 1),
+        ",".join(sorted(filtered)),
+    )
+    return catalog, routing
 
 
 async def call_upstream(tool_name: str, arguments: dict[str, Any]) -> Any:
@@ -438,32 +482,33 @@ async def call_upstream(tool_name: str, arguments: dict[str, Any]) -> Any:
 
 
 def upstream_for(tool_name: str) -> str | None:
-    """Synchronous routing lookup against the latest cached routing table.
-    Returns just the upstream name (the routing table stores
-    (upstream, original_name) tuples to handle name collisions; callers of
-    upstream_for only care about which MCP it lives in)."""
-    routing = _routing_cache.get("r")
-    if routing is None:
-        return None
-    entry = routing.get(tool_name)
-    if entry is None:
-        return None
-    return entry[0]
+    """Synchronous routing lookup against the cached raw discovery. Looks
+    across ALL upstreams (not just the enabled subset) so callers that
+    were given a tool name via a per-call filtered catalog can still map
+    it back to its owning upstream."""
+    raw = _catalog_cache.get("raw") or {}
+    for upstream_name, tools in raw.items():
+        short = _UPSTREAM_SHORT_ID.get(upstream_name, upstream_name)
+        for t in tools:
+            name = t.get("name")
+            if not name:
+                continue
+            if name == tool_name or f"{short}__{name}" == tool_name:
+                return upstream_name
+    return None
 
 
 def snapshot_status() -> dict[str, Any]:
     """Read-only summary of the current proxy state. Useful for /health and
-    debug — exposes upstream URLs + last-known tool counts."""
-    catalog = _catalog_cache.get("c") or []
-    routing = _routing_cache.get("r") or {}
-    per_upstream: dict[str, int] = {name: 0 for name in UPSTREAMS}
-    for tname, entry in routing.items():
-        uname = entry[0] if isinstance(entry, tuple) else entry
-        per_upstream[uname] = per_upstream.get(uname, 0) + 1
+    debug — exposes upstream URLs + raw discovered tool counts (across all
+    upstreams, ignoring per-call enabled filters)."""
+    raw = _catalog_cache.get("raw") or {}
+    per_upstream = {name: len(raw.get(name) or []) for name in UPSTREAMS}
     return {
         "upstreams": {name: {"url": spec["url"], "stateful": spec.get("stateful")}
                        for name, spec in UPSTREAMS.items()},
-        "total_tools": len(catalog),
+        "default_enabled": sorted(DEFAULT_ENABLED_UPSTREAMS),
+        "total_discovered_tools": sum(per_upstream.values()),
         "tools_per_upstream": per_upstream,
         "current_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
     }
@@ -740,12 +785,18 @@ async def research(
     max_seconds: float = 90.0,
     max_input_tokens: int = 25_000,
     answer_style: str = "concise",
+    enabled_upstreams: list[str] | None = None,
     emit: "Callable[[str, dict[str, Any]], Awaitable[None]] | None" = None,
 ) -> dict[str, Any]:
     """Agentic research loop. Planner → Executor → Observer → Synthesizer.
 
     Returns: {query, answer, confidence, citations, findings_count, trace,
               data_gap (if no answer), stats}.
+
+    `enabled_upstreams` restricts which compound-MCP upstreams this loop is
+    allowed to call. Pass a list (e.g. ['authority-web-search', 'rbi-dbie'])
+    to scope the planner + executor to that subset. Unknown names are
+    silently dropped. Pass None to use DEFAULT_ENABLED_UPSTREAMS.
 
     If `emit` is provided, every trace event is also sent through it as
     `await emit(kind, data)` while the loop runs — that's how the MCP
@@ -775,7 +826,10 @@ async def research(
             except Exception as e:  # noqa: BLE001
                 log.warning("progress emit failed: %s", e)
 
-    catalog, routing = await discover_tools()
+    enabled_set: frozenset[str] | None = None
+    if enabled_upstreams is not None:
+        enabled_set = frozenset(enabled_upstreams) & set(UPSTREAMS.keys())
+    catalog, routing = await discover_tools(enabled=enabled_set)
     catalog_brief = _build_catalog_brief(catalog, routing)
 
     # ── PHASE 1: PLAN ────────────────────────────────────────────────────

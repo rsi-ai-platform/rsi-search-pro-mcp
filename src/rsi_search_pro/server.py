@@ -80,11 +80,11 @@ mcp = FastMCP("rsi-search-pro", instructions=_INSTRUCTIONS)
 _RESEARCH_TOOL = Tool(
     name="research",
     description=(
-        "Agentic research over all 6 upstream MCPs. Give it a question; it "
-        "plans, executes, observes each result, re-routes on empty/wrong, "
-        "and returns a cited answer plus a step-by-step trace. Use this "
-        "when you want 'just answer the question'. For fine-grained tool "
-        "control, call the lower-level tools directly. Latency ~5-45s; "
+        "Agentic research across the enabled upstream MCPs. Give it a "
+        "question; it plans, executes, observes each result, re-routes on "
+        "empty/wrong, and returns a cited answer plus a step-by-step trace. "
+        "Use this when you want 'just answer the question'. For fine-grained "
+        "tool control, call the lower-level tools directly. Latency ~5-45s; "
         "internal model spend ~$0.02-$0.15 per call."
     ),
     inputSchema={
@@ -107,6 +107,22 @@ _RESEARCH_TOOL = Tool(
                 "type": "string", "enum": ["concise", "detailed"],
                 "default": "concise",
                 "description": "How long the synthesised answer should be.",
+            },
+            "enabled_upstreams": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": [
+                        "authority-web-search", "browser-research",
+                        "rbi-dbie", "mospi-esankhyiki", "cga", "data-gov",
+                    ],
+                },
+                "description": (
+                    "Optional subset of compound-MCP upstreams the loop is "
+                    "allowed to call. Omit to use the default pool "
+                    "(authority-web-search, browser-research, rbi-dbie, "
+                    "mospi-esankhyiki). Unknown names are silently dropped."
+                ),
             },
         },
         "required": ["query"],
@@ -204,11 +220,15 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
     args = arguments or {}
     if name == "research":
         emit = _build_progress_emitter()
+        eu_raw = args.get("enabled_upstreams")
+        enabled = ([str(u) for u in eu_raw]
+                    if isinstance(eu_raw, list) and eu_raw else None)
         result = await proxy.research(
             args.get("query") or "",
             max_steps=int(args.get("max_steps", 12) or 12),
             max_seconds=float(args.get("max_seconds", 90) or 90),
             answer_style=str(args.get("answer_style", "concise") or "concise"),
+            enabled_upstreams=enabled,
             emit=emit,
         )
     else:
