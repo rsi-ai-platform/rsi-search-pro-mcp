@@ -262,6 +262,27 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
         # The agent must NOT conflate "current FY" with "completed FY".
         # last_completed_fy = the FY that ended March 31 immediately before today.
         last_completed_fy_start = current_fy_start - 1
+        # Partial-current-FY structure — what's available NOW inside the
+        # in-progress FY, by cadence. Daily/weekly series publish up to
+        # ~yesterday; monthly series publish completed months with a lag;
+        # quarterly series publish completed quarters with a longer lag.
+        _IN_MONTHS = ["April", "May", "June", "July", "August", "September",
+                       "October", "November", "December", "January", "February", "March"]
+        completed_fy_months = _IN_MONTHS[:max(0, fy_months_elapsed - 1)]
+        current_fy_month_partial = (
+            _IN_MONTHS[fy_months_elapsed - 1] if fy_months_elapsed >= 1 else None
+        )
+        completed_fy_quarters = []
+        for q in range(1, fy_quarter_in):
+            qs = _IN_MONTHS[(q - 1) * 3:(q - 1) * 3 + 3]
+            completed_fy_quarters.append({
+                "label": f"Q{q}", "months": qs,
+                "range": f"{current_fy_start + (1 if q == 4 else 0)}-"
+                          f"{['04','07','10','01'][q-1]}-01 → "
+                          f"{current_fy_start + (1 if q >= 3 else 0)}-"
+                          f"{['06','09','12','03'][q-1]}-"
+                          f"{['30','30','31','31'][q-1]}",
+            })
         # last_3_completed_fys (oldest → newest).
         def _fy_label(start: int) -> str:
             return f"FY{str(start + 1)[-2:]}"  # FY{YY end-year}
@@ -292,16 +313,26 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
             "last_completed_fy_in": _fy_label(last_completed_fy_start),
             "last_3_completed_fys_in": last_3,
             "last_3_completed_fy_ranges": last_3_ranges,
+            # Partial-current-FY structure — fetch THIS too on 'last N years' queries.
+            "current_fy_completed_months": completed_fy_months,
+            "current_fy_completed_quarters": completed_fy_quarters,
+            "current_fy_partial_month": current_fy_month_partial,
+            "data_latest_period": (
+                f"{current_fy_start + (1 if now.month <= 3 else 0)}-"
+                f"{now.month:02d}-{now.day:02d}"
+            ),
             "note": (
                 "Indian FY runs April→March. FY{YY} = 1 Apr 20{YY-1} → "
-                "31 Mar 20{YY}. CRITICAL FOR 'LAST N YEARS' QUERIES: "
-                "the current FY (financial_year_in above) is IN PROGRESS — "
-                "do NOT include it in 'last N completed years'. 'Last 3 "
-                "years' → last_3_completed_fys_in. To also fetch partial "
-                "data for the in-progress FY, use fy_quarter_in + "
-                "fy_month_in. Skipping this distinction leads to "
-                "off-by-one errors (querying FY{YY-3}..FY{YY-1} instead "
-                "of FY{YY-2}..FY{YY})."
+                "31 Mar 20{YY}. For 'last N years' queries: cover the "
+                "last N COMPLETED FYs (last_3_completed_fys_in) AND the "
+                "in-progress current FY up to today — completed months "
+                "(current_fy_completed_months), completed quarters "
+                "(current_fy_completed_quarters), and partial-month / "
+                "daily / weekly data right up to iso_date. Data cadence "
+                "varies — daily petrol prices, weekly money-supply, "
+                "monthly CPI / IIP, quarterly GDP — always look for the "
+                "freshest data the source publishes; do NOT cap your "
+                "query at the previous FY's March 31."
             ),
         }
         return [TextContent(type="text", text=json.dumps(result, default=str))]
