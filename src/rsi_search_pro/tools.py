@@ -30,9 +30,9 @@ log = logging.getLogger("rsi_search_pro")
 # Production defaults point at the live Cloud Run services.
 # ============================================================================
 
-# Six-upstream pool. Each entry carries the URL, whether the upstream is a
-# stateful MCP (needs Mcp-Session-Id threaded), an optional bearer token
-# (CGA), and a short capability hint the research() planner uses to route.
+# Four-upstream pool. Each entry carries the URL, whether the upstream is
+# a stateful MCP (needs Mcp-Session-Id threaded), an optional bearer token,
+# and a short capability hint the research() planner uses to route.
 # Stateless upstreams skip the initialize round-trip entirely.
 UPSTREAMS: dict[str, dict[str, Any]] = {
     "authority-web-search": {
@@ -93,34 +93,6 @@ UPSTREAMS: dict[str, dict[str, Any]] = {
             "for Indian macro indicators."
         ),
     },
-    "data-gov": {
-        "url": os.environ.get(
-            "DATA_GOV_URL",
-            "https://data-gov-mcp-800435094335.asia-south1.run.app/mcp",
-        ),
-        "stateful": False,
-        "token": None,
-        "capability": (
-            "India's open-data portal — 100k+ government datasets across "
-            "every ministry and state. Tools: search_datasets (keyword "
-            "search), get_dataset_info (metadata), get_data (rows). The "
-            "long-tail ladder for any 'I need official Indian X' query."
-        ),
-    },
-    "cga": {
-        "url": os.environ.get(
-            "CGA_URL",
-            "https://cga-mcp-800435094335.us-central1.run.app/mcp",
-        ),
-        "stateful": True,
-        "token": os.environ.get("CGA_AUTH_TOKEN"),
-        "capability": (
-            "Controller General of Accounts (Ministry of Finance). "
-            "Monthly union government accounts, NSDP (state-level fiscal "
-            "indicators), finance accounts, circulars, dashboard data. "
-            "Canonical for Indian central + state public finance series."
-        ),
-    },
 }
 
 
@@ -179,13 +151,12 @@ _UPSTREAM_SHORT_ID: dict[str, str] = {
     "browser-research": "br",
     "rbi-dbie": "rbi",
     "mospi-esankhyiki": "mospi",
-    "data-gov": "dgov",
-    "cga": "cga",
 }
 
 
-# Per-upstream session state for stateful MCPs (e.g. CGA). Initialized on
-# first call to the upstream and reused across the process lifetime.
+# Per-upstream session state for stateful MCPs. Initialized on first call
+# and reused across the process lifetime. Currently no stateful upstreams
+# in the active pool; kept for forward compat when one returns.
 _session_ids: dict[str, str | None] = {name: None for name in UPSTREAMS}
 _session_locks: dict[str, asyncio.Lock] = {name: asyncio.Lock() for name in UPSTREAMS}
 
@@ -198,9 +169,9 @@ async def _rpc_to(upstream_name: str, method: str,
     bearer token + session id based on the upstream's config. Returns the
     parsed JSON-RPC response body (with `result` or `error`).
 
-    For stateful upstreams (currently CGA), lazily initializes the session
-    on the first call and reuses it thereafter. Stateless upstreams
-    short-circuit the initialize round-trip.
+    For stateful upstreams, lazily initializes the session on the first
+    call and reuses it thereafter. Stateless upstreams (the entire active
+    pool right now) short-circuit the initialize round-trip.
     """
     spec = UPSTREAMS[upstream_name]
     url = spec["url"]
@@ -541,8 +512,7 @@ _PLANNER_SYSTEM = (
     "     excel_fetch_structured for direct sources.\n"
     "  3. http_post_form for AJAX-dropdown gov dashboards (PPAC etc).\n"
     "  4. Source-specific upstreams: RBI DBIE (repo rate, FX), eSankhyiki\n"
-    "     MoSPI (CPI, IIP, GDP), Data.gov.in (long-tail datasets), CGA\n"
-    "     (union/state public finance).\n"
+    "     MoSPI (CPI, IIP, GDP).\n"
     "  5. browser-research visit / act / extract — LAST RESORT (5-45s,\n"
     "     real Chromium). Only when 1-4 won't reach the data.\n\n"
     "TIME-SERIES queries (multiple months, multiple years, N data points):\n"
@@ -596,7 +566,8 @@ _OBSERVER_SYSTEM = (
     "                              Gross_Net_Tax_collection.xlsx\n"
     "    CPI / IIP / GDP         → mospi__get_data\n"
     "    Repo rate / FX / money  → rbi__get_data\n"
-    "    Union / state accounts  → cga__get_monthly_account\n"
+    "    Union / state accounts  → pdf_fetch_structured on cga.nic.in\n"
+    "                              monthly account PDFs.\n"
     "  News and Wikipedia are LAST-resort cross-checks ONLY when the gov\n"
     "  source is provably unreachable.\n\n"
     "ERROR-KIND HANDLING:\n"
