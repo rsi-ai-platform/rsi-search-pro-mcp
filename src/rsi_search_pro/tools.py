@@ -41,7 +41,11 @@ UPSTREAMS: dict[str, dict[str, Any]] = {
             "https://authority-web-search-mcp-pef65a33ta-el.a.run.app/mcp",
         ),
         "stateful": False,
-        "token": None,
+        # MCP_BEARER_AUTHORITY is the upstream's static bearer secret —
+        # the same value bound to authority-web-search-mcp's
+        # MCP_BEARER_TOKEN env var. Set when we want this proxy to
+        # authenticate to a locked-down upstream.
+        "token": os.environ.get("MCP_BEARER_AUTHORITY"),
         "capability": (
             "Authoritative web search + structured fetch. Tavily 3-pass "
             "ladder against 87 curated authority domains, PDF / Excel / "
@@ -56,7 +60,7 @@ UPSTREAMS: dict[str, dict[str, Any]] = {
             "https://browser-research-mcp-pef65a33ta-el.a.run.app/mcp",
         ),
         "stateful": False,
-        "token": None,
+        "token": os.environ.get("MCP_BEARER_BROWSER"),
         "capability": (
             "Real Chromium via patched Playwright + Sonnet vision. "
             "Last-resort: JS-rendered SPAs, login walls, chart-only "
@@ -70,7 +74,7 @@ UPSTREAMS: dict[str, dict[str, Any]] = {
             "https://rbi-dbie-mcp-pef65a33ta-el.a.run.app/mcp",
         ),
         "stateful": False,
-        "token": None,
+        "token": os.environ.get("MCP_BEARER_RBI"),
         "capability": (
             "Reserve Bank of India — Database on Indian Economy. 474 "
             "SDMX-style datasets across Financial Market, External "
@@ -117,7 +121,7 @@ UPSTREAMS: dict[str, dict[str, Any]] = {
             "https://data-gov-mcp-pef65a33ta-el.a.run.app/mcp",
         ),
         "stateful": False,
-        "token": None,
+        "token": os.environ.get("MCP_BEARER_DATA_GOV"),
         "capability": (
             "India's open-data portal — 100k+ government datasets across "
             "every ministry and state. Long-tail discovery for queries the "
