@@ -84,11 +84,18 @@ jobs:
             --region=$REGION --project=$PROJECT_ID \
             --format='value(status.url)')
           echo "Service URL: $URL"
+          # The MCP enforces HybridAuthMiddleware — unauthed POST /mcp
+          # returns 401. Pull the static bearer from Secret Manager (same
+          # value the service has bound as MCP_BEARER_TOKEN) and attach
+          # it so the smoke test can list tools.
+          TOKEN=$(gcloud secrets versions access latest \
+            --secret=mcp-bearer-rsi --project=$PROJECT_ID)
           # Stateless HTTP: no Mcp-Session-Id round-trip. Hit tools/list
           # directly and confirm it merges 12 + 3 = 15 tools from upstreams.
           RESP=$(curl -fsS -X POST "$URL/mcp" \
             -H 'Content-Type: application/json' \
             -H 'Accept: application/json, text/event-stream' \
+            -H "Authorization: Bearer $TOKEN" \
             -d '{"jsonrpc":"2.0","id":"2","method":"tools/list","params":{}}')
           echo "$RESP" | head -c 400
           # Authority Web Search must contribute at least these names:
