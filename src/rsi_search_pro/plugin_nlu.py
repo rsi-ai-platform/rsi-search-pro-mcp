@@ -66,23 +66,43 @@ def attached_plugin_ids() -> list[str]:
     return list(_ATTACHED)
 
 
+_FETCH_TIMEOUT = float(os.environ.get("PLUGIN_BUNDLE_FETCH_TIMEOUT", "30"))
+_FETCH_RETRIES = int(os.environ.get("PLUGIN_BUNDLE_FETCH_RETRIES", "3"))
+
+
 async def _fetch_bundle(plugin_id: str) -> dict[str, Any] | None:
+    """Fetch the bundle with retries + exponential backoff. Empty-string
+    httpx errors (the original 15s timeout symptom) are now logged with
+    their exception type so future incidents are diagnosable."""
     url = f"{_BUNDLE_BASE_URL}/{plugin_id}/bundle"
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            r = await client.get(url)
-            r.raise_for_status()
-            data = r.json()
-            log.info(
-                "Fetched plugin bundle %s (%d indicators, %d authority rules)",
-                plugin_id,
-                data.get("counts", {}).get("indicators", 0),
-                data.get("counts", {}).get("authority_rules", 0),
+    last_err: Exception | None = None
+    for attempt in range(1, _FETCH_RETRIES + 1):
+        try:
+            async with httpx.AsyncClient(timeout=_FETCH_TIMEOUT) as client:
+                r = await client.get(url)
+                r.raise_for_status()
+                data = r.json()
+                log.info(
+                    "Fetched plugin bundle %s on attempt %d (%d indicators, %d authority rules)",
+                    plugin_id, attempt,
+                    data.get("counts", {}).get("indicators", 0),
+                    data.get("counts", {}).get("authority_rules", 0),
+                )
+                return data
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            log.warning(
+                "Bundle fetch attempt %d/%d for %s failed (%s: %r)",
+                attempt, _FETCH_RETRIES, plugin_id, type(e).__name__, str(e),
             )
-            return data
-    except Exception as e:  # noqa: BLE001
-        log.warning("Failed to fetch plugin bundle %s: %s", plugin_id, e)
-        return None
+            if attempt < _FETCH_RETRIES:
+                await asyncio.sleep(min(2 ** attempt, 8))
+    log.error(
+        "Bundle fetch giving up for %s after %d attempts; last error: %s: %r",
+        plugin_id, _FETCH_RETRIES, type(last_err).__name__,
+        str(last_err) if last_err else "<no exception captured>",
+    )
+    return None
 
 
 async def get_bundles(force: bool = False) -> list[dict[str, Any]]:
@@ -200,12 +220,27 @@ async def understand(
     bundles = await get_bundles()
     juris = (jurisdiction_hint or "").upper().strip()
     if not bundles:
+        # Distinguish the 3 reasons we'd get here so the trace is diagnosable:
+        #   1. ATTACHED_PLUGINS env not set            → enabled() is False
+        #   2. env set, but fetch failed (no cache)    → "bundle_fetch_failed"
+        #   3. env set, fetch returned non-dict        → handled inside _fetch_bundle
+        if not enabled():
+            rationale = (
+                "ATTACHED_PLUGINS env not set on this MCP — no plugin attached. "
+                "Set ATTACHED_PLUGINS=<id> + PLUGIN_BUNDLE_BASE_URL=<backend>."
+            )
+        else:
+            rationale = (
+                f"Plugin {_ATTACHED!r} attached but bundle fetch failed. "
+                f"Check that {_BUNDLE_BASE_URL}/<id>/bundle is reachable from "
+                "this MCP (cold-start backend? network?). Will retry on next call."
+            )
         return {
             "indicators": [],
             "source_ids": [],
             "jurisdiction": juris or "IN",
             "confidence": 0.0,
-            "rationale": "no attached plugin bundles available",
+            "rationale": rationale,
             "plugins": [],
         }
 
@@ -294,6 +329,51 @@ async def understand(
         "rationale": parsed.get("rationale") or "",
         "plugins": [b.get("plugin_id") for b in bundles],
     }
+
+
+async def warm_up() -> None:
+    """Best-effort pre-fetch of every attached bundle. Call at MCP startup
+    so the first user request doesn't pay the fetch latency."""
+    if not enabled():
+        log.info("plugin_nlu warm_up: no plugins attached")
+        return
+    try:
+        bundles = await get_bundles(force=True)
+        log.info(
+            "plugin_nlu warm_up: fetched %d bundle(s) for plugins=%s",
+            len(bundles), [b.get("plugin_id") for b in bundles],
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("plugin_nlu warm_up failed (will retry lazily): %s: %r",
+                    type(e).__name__, e)
+
+
+def _schedule_warmup() -> None:
+    """Spawn a daemon thread that runs warm_up() in its own event loop. Fires at
+    module import time so the bundle is usually cached before the first user
+    request arrives. Safe to call in any sync context."""
+    if not enabled():
+        return
+    if os.environ.get("PLUGIN_NLU_DISABLE_WARMUP"):
+        log.info("plugin_nlu warmup disabled via env")
+        return
+    import threading
+
+    def _runner() -> None:
+        try:
+            asyncio.run(warm_up())
+        except Exception as e:  # noqa: BLE001
+            log.warning("warmup thread failed: %s: %r", type(e).__name__, e)
+
+    threading.Thread(
+        target=_runner,
+        daemon=True,
+        name="plugin-nlu-warmup",
+    ).start()
+
+
+# Fire warm-up on import. Daemon thread → never blocks MCP startup.
+_schedule_warmup()
 
 
 def status() -> dict[str, Any]:
