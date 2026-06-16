@@ -151,6 +151,31 @@ _TODAY_TOOL = Tool(
 )
 
 
+_UNDERSTAND_QUERY_TOOL = Tool(
+    name="understand_query",
+    description=(
+        "Map a free-text query to plugin-defined indicators and authority "
+        "source-ids (the NLU layer). Call this BEFORE `research` (or any "
+        "upstream tool) when you don't already know which authority sources "
+        "apply — it consults the attached plugin (e.g. indian_finance) and "
+        "tells you what the query is about so subsequent steps can use a "
+        "tighter authority filter. Returns {indicators, source_ids, "
+        "jurisdiction, confidence, rationale, plugins}. Returns an empty / "
+        "unconfident plan when no plugin is attached, the bundle fetch "
+        "failed, or the Haiku call errored — fall through to topic / "
+        "jurisdiction defaults in that case."
+    ),
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "query": {"type": "string"},
+            "jurisdiction_hint": {"type": "string"},
+        },
+        "required": ["query"],
+    },
+)
+
+
 @mcp._mcp_server.list_tools()  # type: ignore[misc]
 async def _list_tools() -> list[Tool]:
     """Return `today` + `research` + the merged proxy catalog. Catalog hits
@@ -167,7 +192,7 @@ async def _list_tools() -> list[Tool]:
         for t in catalog
         if not t["name"].endswith("__today")
     ]
-    return [_TODAY_TOOL, _RESEARCH_TOOL, *proxied]
+    return [_TODAY_TOOL, _UNDERSTAND_QUERY_TOOL, _RESEARCH_TOOL, *proxied]
 
 
 def _build_progress_emitter():
@@ -336,6 +361,13 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
             ),
         }
         return [TextContent(type="text", text=json.dumps(result, default=str))]
+    if name == "understand_query":
+        from . import plugin_nlu
+        verdict = await plugin_nlu.understand(
+            (args.get("query") or "").strip(),
+            jurisdiction_hint=args.get("jurisdiction_hint"),
+        )
+        return [TextContent(type="text", text=json.dumps(verdict, default=str))]
     if name == "research":
         emit = _build_progress_emitter()
         eu_raw = args.get("enabled_upstreams")
