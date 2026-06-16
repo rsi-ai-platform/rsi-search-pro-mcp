@@ -845,12 +845,57 @@ async def research(
     catalog, routing = await discover_tools(enabled=enabled_set)
     catalog_brief = _build_catalog_brief(catalog, routing)
 
+    # ── PHASE 0: NLU ─────────────────────────────────────────────────────
+    # When a plugin is attached, ask it what the query is about BEFORE the
+    # planner runs. The verdict (indicators + source_ids + jurisdiction)
+    # gets piped into the planner's user prompt so upstream selection
+    # aligns with the plugin's authority routing rather than the planner
+    # guessing. Best-effort — failures don't block planning.
+    from . import plugin_nlu
+    nlu_result: dict[str, Any] | None = None
+    nlu_brief = ""
+    if plugin_nlu.enabled():
+        nlu_t0 = time.perf_counter()
+        try:
+            nlu_result = await plugin_nlu.understand(query)
+        except Exception as e:  # noqa: BLE001
+            log.warning("research(): plugin NLU pre-step failed: %s", e)
+        if nlu_result:
+            await _record({
+                "kind": "nlu", "t_ms": _now_ms(),
+                "duration_ms": round((time.perf_counter() - nlu_t0) * 1000),
+                "indicators": nlu_result.get("indicators") or [],
+                "source_ids": nlu_result.get("source_ids") or [],
+                "jurisdiction": nlu_result.get("jurisdiction") or "IN",
+                "confidence": nlu_result.get("confidence") or 0.0,
+                "plugins": nlu_result.get("plugins") or [],
+                "rationale": nlu_result.get("rationale") or "",
+            })
+            if nlu_result.get("indicators") or nlu_result.get("source_ids"):
+                nlu_brief = (
+                    "\nPLUGIN ROUTING ({plugins}): the attached plugin maps "
+                    "this query to indicators={indicators} and authority "
+                    "sources={sources} (jurisdiction={juris}, conf={conf:.2f}).\n"
+                    "Treat these as STRONG hints. Prefer upstreams that "
+                    "natively serve those indicators / source-ids — RBI DBIE "
+                    "for RBI source-id, MoSPI eSankhyiki for MOSPI/NSO, "
+                    "data.gov.in for DataGovIn, authority-web-search for any "
+                    "named domain. Use the matched indicator vocabulary when "
+                    "shaping tool args (e.g. dataset queries, search terms)."
+                ).format(
+                    plugins=",".join(nlu_result.get("plugins") or []) or "?",
+                    indicators=nlu_result.get("indicators") or [],
+                    sources=nlu_result.get("source_ids") or [],
+                    juris=nlu_result.get("jurisdiction") or "IN",
+                    conf=float(nlu_result.get("confidence") or 0.0),
+                )
+
     # ── PHASE 1: PLAN ────────────────────────────────────────────────────
     plan_t0 = time.perf_counter()
     plan_resp = await _llm_call(
         _planner_model(),
         _PLANNER_SYSTEM,
-        f"USER QUERY: {query}\n\n{catalog_brief}\n\n"
+        f"USER QUERY: {query}\n{nlu_brief}\n{catalog_brief}\n\n"
         f"Plan ≤{max_steps} steps. Return JSON only.",
         max_tokens=2200,
     )
