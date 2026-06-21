@@ -71,11 +71,16 @@ jobs:
           # defaults services to authenticated and the smoke test that follows
           # would get a 403. Pure-aggregator endpoint with no secrets, so
           # public ingress is fine — upstream MCPs enforce their own auth.
+          # --min-instances=1 keeps one container warm so callers don't pay
+          # a ~3-8s cold start on the first request after idle. Set explicitly
+          # on every deploy so the contract is declarative — Cloud Run
+          # otherwise defaults to 0.
           gcloud run deploy $SERVICE \
             --image=$IMAGE_BASE:${{ github.sha }} \
             --region=$REGION \
             --project=$PROJECT_ID \
             --allow-unauthenticated \
+            --min-instances=1 \
             --quiet
 
       - name: Smoke-test the deployed MCP
